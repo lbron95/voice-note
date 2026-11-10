@@ -70,6 +70,12 @@ button{cursor:pointer}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
 .recording .dot{background:var(--rec);animation:blink 1.2s infinite}
 @keyframes blink{50%{opacity:.25}}
+.sr{display:flex;align-items:flex-start;gap:8px;font-size:13.5px;color:var(--muted);line-height:1.5}
+.sr i{width:8px;height:8px;border-radius:50%;background:var(--muted);flex:none;margin-top:6px}
+.sr[data-k="ok"] i{background:#2f9e5b}
+.sr[data-k="warn"] i{background:#d99a1e}
+.sr[data-k="bad"] i{background:var(--rec)}
+.sr[data-k="bad"]{color:var(--ink)}
 canvas.meter{flex:1;min-width:120px;height:40px;width:100%}
 .controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 .big{display:inline-flex;align-items:center;justify-content:center;gap:8px;border:0;border-radius:999px;padding:12px 22px;font-size:16px;font-weight:600;line-height:1}
@@ -142,6 +148,7 @@ canvas.meter{flex:1;min-width:120px;height:40px;width:100%}
           <div class="state" id="state"><i class="dot"></i><span id="stateTx">대기 중</span></div>
           <canvas class="meter" id="meter"></canvas>
         </div>
+        <div class="sr" id="sr" hidden><i></i><span id="srTx"></span></div>
         <div class="controls" id="controls"></div>
         <div class="opts" id="opts">
           <label>언어
@@ -207,6 +214,9 @@ canvas.meter{flex:1;min-width:120px;height:40px;width:100%}
   let mode = 'idle';        // idle | recording | paused | stopping
   let stream = null, recorder = null, chunks = [], mimeType = '';
   let recog = null, recogFatal = false, interim = '', pendingStart = null;
+  let errCount = 0, lastErr = '', netWarned = false;
+  const srBox = document.getElementById('sr'), srText = document.getElementById('srTx');
+  function setSR(text, kind){ srBox.hidden = false; srBox.dataset.k = kind || ''; srText.textContent = text; }
   let accMs = 0, resumedAt = 0, tick = null;
   let audioCtx = null, analyser = null, rafId = 0;
   let wakeLock = null, audioUrl = null;
@@ -286,6 +296,7 @@ canvas.meter{flex:1;min-width:120px;height:40px;width:100%}
     $('meta').textContent = fresh && !live ? '' :
       `${dateStr(note.created)} · ${fmt(live ? elapsed() : note.duration)} · ${$('lang').querySelector(`[value="${note.lang}"]`)?.textContent || note.lang}`;
     $('lang').disabled = live; $('keepAudio').disabled = live;
+    if (!live) srBox.hidden = true;
     renderControls(); renderScript();
   }
 
@@ -334,6 +345,7 @@ canvas.meter{flex:1;min-width:120px;height:40px;width:100%}
     r.lang = note.lang; r.interimResults = true; r.maxAlternatives = 1;
     r.continuous = !isAndroid;   // 안드로이드는 연속 모드에서 문장이 중복돼서 짧게 끊어 반복한다
     r.onresult = e => {
+      errCount = 0; setSR('말소리 받아쓰는 중', 'ok');
       let tmp = '';
       for (let i = e.resultIndex; i < e.results.length; i++){
         const res = e.results[i], t = res[0].transcript;
@@ -345,15 +357,24 @@ canvas.meter{flex:1;min-width:120px;height:40px;width:100%}
       }
       interim = tmp.trim(); liveScript();
     };
+    r.onstart = () => setSR('받아쓰기 듣는 중', 'ok');
+    r.onspeechstart = () => setSR('말소리 받아쓰는 중', 'ok');
     r.onerror = e => {
-      if (e.error === 'not-allowed' || e.error === 'service-not-allowed'){ recogFatal = true; toast('마이크(음성 인식) 권한이 막혀 있습니다'); }
-      else if (e.error === 'audio-capture'){ recogFatal = true; toast('받아쓰기가 마이크를 못 잡았습니다. "음성 파일도 저장"을 끄고 해 보세요'); }
-      else if (e.error === 'network'){ toast('인터넷 연결이 끊겨 받아쓰기가 잠시 멈췄습니다'); }
-      else if (e.error === 'language-not-supported'){ recogFatal = true; toast('이 언어는 지원하지 않습니다'); }
+      lastErr = e.error; errCount++;
+      if (e.error === 'not-allowed' || e.error === 'service-not-allowed'){ recogFatal = true; setSR('받아쓰기 권한이 막혀 있습니다. 주소창 왼쪽 아이콘에서 마이크를 허용해 주세요', 'bad'); }
+      else if (e.error === 'audio-capture'){ recogFatal = true; setSR('받아쓰기가 마이크를 못 잡았습니다. "음성 파일도 저장"을 끄고 다시 해 보세요', 'bad'); }
+      else if (e.error === 'language-not-supported'){ recogFatal = true; setSR('이 언어는 지원하지 않습니다', 'bad'); }
+      else if (e.error === 'network'){ setSR('인터넷 연결 문제로 받아쓰기가 멈췄습니다. 다시 연결하는 중', 'bad'); if (!netWarned){ netWarned = true; toast('인터넷이 끊겨도 녹음은 계속됩니다'); } }
+      else if (e.error === 'no-speech'){ setSR('말소리가 들리지 않습니다. 윈도우 기본 마이크가 지금 쓰는 마이크인지 확인해 주세요', 'warn'); }
+      else if (e.error !== 'aborted'){ setSR('받아쓰기 오류: ' + e.error + ' (다시 연결하는 중)', 'bad'); }
     };
     r.onend = () => {
+      flushInterim(); liveScript();   // 끊기는 순간 확정 안 된 문장도 버리지 않고 남긴다
       if (mode === 'recording' && !recogFatal){
-        setTimeout(() => { if (mode === 'recording') try { r.start(); } catch(_){} }, isAndroid ? 50 : 250);
+        const wait = errCount ? Math.min(8000, 400 * 2 ** Math.min(errCount, 5)) : (isAndroid ? 50 : 150);
+        if (errCount) setSR(srText.textContent, srBox.dataset.k);
+        else setSR('다시 연결하는 중', 'warn');
+        setTimeout(() => { if (mode === 'recording' && recog === r) try { r.start(); } catch(_){} }, wait);
       } else if (r._done) r._done();
     };
     return r;
@@ -383,7 +404,7 @@ canvas.meter{flex:1;min-width:120px;height:40px;width:100%}
     if (!SR && !keep) return toast('이 브라우저에선 받아쓰기가 안 되니 "음성 파일도 저장"을 켜 주세요');
     if (note.segments.length || note.audio){ open(blank()); }
     note.lang = $('lang').value; note.created = Date.now();
-    recogFatal = false; interim = ''; pendingStart = null; chunks = [];
+    recogFatal = false; interim = ''; pendingStart = null; chunks = []; errCount = 0; netWarned = false;
     try {
       if (keep){
         if (!navigator.mediaDevices?.getUserMedia) throw new Error('nomic');
@@ -402,8 +423,9 @@ canvas.meter{flex:1;min-width:120px;height:40px;width:100%}
       return toast('마이크를 켤 수 없습니다. 브라우저의 마이크 권한을 확인해 주세요');
     }
     mode = 'recording'; accMs = 0; resumedAt = Date.now();
-    if (SR){ recog = makeRecog(); try { recog.start(); } catch(_){} }
-    tick = setInterval(() => { $('timer').textContent = fmt(elapsed()); }, 250);
+    if (SR){ setSR('받아쓰기 연결하는 중', 'warn'); recog = makeRecog(); try { recog.start(); } catch(_){} }
+    else setSR('이 브라우저는 받아쓰기를 지원하지 않아 녹음만 합니다', 'bad');
+    tick =setInterval(() => { $('timer').textContent = fmt(elapsed()); }, 250);
     lockScreen();
     render(); refreshList();
   }
@@ -416,8 +438,8 @@ canvas.meter{flex:1;min-width:120px;height:40px;width:100%}
   function resume(){
     mode = 'recording'; resumedAt = Date.now();
     recorder?.state === 'paused' && recorder.resume();
-    if (SR && !recogFatal){ recog = makeRecog(); try { recog.start(); } catch(_){} }
     render();
+    if (SR && !recogFatal){ errCount = 0; setSR('받아쓰기 연결하는 중', 'warn'); recog = makeRecog(); try { recog.start(); } catch(_){} }
   }
   async function stop(){
     accMs = elapsed(); const wasMode = mode; mode = 'stopping'; render();

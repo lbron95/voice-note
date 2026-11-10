@@ -214,7 +214,7 @@ canvas.meter{flex:1;min-width:120px;height:40px;width:100%}
   let mode = 'idle';        // idle | recording | paused | stopping
   let stream = null, recorder = null, chunks = [], mimeType = '';
   let recog = null, recogFatal = false, interim = '', pendingStart = null;
-  let errCount = 0, lastErr = '', netWarned = false;
+  let errCount = 0, lastErr = '', netWarned = false, lastResultAt = 0, lastVoiceAt = 0, stallCount = 0;
   const srBox = document.getElementById('sr'), srText = document.getElementById('srTx');
   function setSR(text, kind){ srBox.hidden = false; srBox.dataset.k = kind || ''; srText.textContent = text; }
   let accMs = 0, resumedAt = 0, tick = null;
@@ -345,7 +345,7 @@ canvas.meter{flex:1;min-width:120px;height:40px;width:100%}
     r.lang = note.lang; r.interimResults = true; r.maxAlternatives = 1;
     r.continuous = !isAndroid;   // 안드로이드는 연속 모드에서 문장이 중복돼서 짧게 끊어 반복한다
     r.onresult = e => {
-      errCount = 0; setSR('말소리 받아쓰는 중', 'ok');
+      errCount = 0; lastResultAt = Date.now(); setSR('말소리 받아쓰는 중', 'ok');
       let tmp = '';
       for (let i = e.resultIndex; i < e.results.length; i++){
         const res = e.results[i], t = res[0].transcript;
@@ -357,7 +357,7 @@ canvas.meter{flex:1;min-width:120px;height:40px;width:100%}
       }
       interim = tmp.trim(); liveScript();
     };
-    r.onstart = () => setSR('받아쓰기 듣는 중', 'ok');
+    r.onstart = () => { r._restarting = false; lastResultAt = Date.now(); setSR('받아쓰기 듣는 중', 'ok'); };
     r.onspeechstart = () => setSR('말소리 받아쓰는 중', 'ok');
     r.onerror = e => {
       lastErr = e.error; errCount++;
@@ -378,6 +378,25 @@ canvas.meter{flex:1;min-width:120px;height:40px;width:100%}
       } else if (r._done) r._done();
     };
     return r;
+  }
+  // 받아쓰기 멈춤 감시: 글자가 확정 안 된 채 4초, 또는 말소리가 들리는데 7초째 결과가 없으면 다시 켠다
+  function checkStall(){
+    const r = recog;
+    if (mode !== 'recording' || !r || r._restarting || recogFatal) return;
+    const now = Date.now(), quiet = now - lastResultAt;
+    const stuckInterim = interim && quiet > 4000;
+    const deafToVoice = stream && now - lastVoiceAt < 1500 && quiet > 7000;
+    if (!stuckInterim && !deafToVoice) return;
+    r._restarting = true; stallCount++;
+    setSR('받아쓰기가 멈춰서 다시 켜는 중', 'warn');
+    try { r.abort(); } catch(_){}
+    setTimeout(() => {   // abort에도 반응이 없으면 새로 만든다
+      if (mode === 'recording' && recog === r && r._restarting){
+        flushInterim(); liveScript();
+        recog = makeRecog(); lastResultAt = Date.now();
+        try { recog.start(); } catch(_){}
+      }
+    }, 1500);
   }
   function stopRecog(){
     return new Promise(res => {
@@ -408,7 +427,7 @@ canvas.meter{flex:1;min-width:120px;height:40px;width:100%}
     try {
       if (keep){
         if (!navigator.mediaDevices?.getUserMedia) throw new Error('nomic');
-        stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true, noiseSuppression:true}});
+        stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false, noiseSuppression:false, autoGainControl:false}});   // 켜 두면 크롬 받아쓰기와 마이크 처리가 부딪혀 멈추는 일이 있다
         const m = pickMime();
         if (m !== null){
           recorder = new MediaRecorder(stream, m ? {mimeType:m} : undefined);
@@ -425,7 +444,8 @@ canvas.meter{flex:1;min-width:120px;height:40px;width:100%}
     mode = 'recording'; accMs = 0; resumedAt = Date.now();
     if (SR){ setSR('받아쓰기 연결하는 중', 'warn'); recog = makeRecog(); try { recog.start(); } catch(_){} }
     else setSR('이 브라우저는 받아쓰기를 지원하지 않아 녹음만 합니다', 'bad');
-    tick =setInterval(() => { $('timer').textContent = fmt(elapsed()); }, 250);
+    lastResultAt = Date.now();
+    tick = setInterval(() => { $('timer').textContent = fmt(elapsed()); checkStall(); }, 250);
     lockScreen();
     render(); refreshList();
   }
@@ -486,6 +506,7 @@ canvas.meter{flex:1;min-width:120px;height:40px;width:100%}
         analyser.getByteTimeDomainData(buf);
         let sum = 0; for (const v of buf){ const x = (v-128)/128; sum += x*x; }
         const lvl = mode === 'recording' ? Math.min(1, Math.sqrt(sum/buf.length)*4) : 0;
+        if (lvl > 0.12) lastVoiceAt = Date.now();
         history.push(lvl); history.shift(); drawBars(history);
       };
       rafId = requestAnimationFrame(loop);
